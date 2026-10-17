@@ -1,8 +1,0 @@
-# Datos y claves: nunca al repositorio
-*.db
-.streamlit/secrets.toml
-
-# Basura de Python
-__pycache__/
-.venv/
-venv/
