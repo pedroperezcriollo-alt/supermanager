@@ -1,3 +1,4 @@
 streamlit
 pandas
 libsql==0.1.11
+tzdata
