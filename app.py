@@ -1,4 +1,5 @@
 from datetime import datetime, date, time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import streamlit as st
@@ -10,6 +11,18 @@ from procesar_jornada import (CAMPOS, CONFIG_DEFECTO, MOTIVO_AUTOTOPILLO,
                               guardar_config, leer_config, procesar_cierre_jornada)
 
 ADMIN_PASSWORD = db.secreto("SM_ADMIN_PASSWORD", "cambiame")
+
+# El servidor de Streamlit Cloud va en hora UTC: todas las horas de la liga
+# (cierre del mercado) se interpretan en hora de Madrid.
+try:
+    ZONA = ZoneInfo("Europe/Madrid")
+except ZoneInfoNotFoundError:  # Windows sin el paquete tzdata
+    ZONA = None
+
+
+def ahora():
+    """Hora actual en Madrid, sin zona (para comparar con las horas guardadas)."""
+    return datetime.now(ZONA).replace(tzinfo=None) if ZONA else datetime.now()
 
 st.set_page_config(page_title="SuperManager Basket", page_icon="🏀", layout="centered")
 
@@ -50,7 +63,7 @@ def mercado_cerrado(j):
     cierre = j["cierre_mercado"]
     if isinstance(cierre, str) and cierre:
         try:
-            return datetime.now() >= datetime.fromisoformat(cierre)
+            return ahora() >= datetime.fromisoformat(cierre)
         except ValueError:
             return False
     return False
@@ -185,7 +198,7 @@ with tab_admin:
         with st.form("nueva_jornada"):
             c1, c2, c3 = st.columns(3)
             n = c1.number_input("Nº jornada", min_value=1, value=siguiente, step=1)
-            f = c2.date_input("Fecha del partido", value=date.today())
+            f = c2.date_input("Fecha del partido", value=ahora().date())
             h = c3.time_input("Hora del salto inicial", value=time(20, 0))
             if st.form_submit_button("Abrir jornada"):
                 if db.filas(CON, "SELECT 1 FROM jornadas WHERE numero = ?", (int(n),)):
@@ -307,7 +320,7 @@ with tab_admin:
                 st.session_state["copia"] = copias.exportar(CON)
         if "copia" in st.session_state:
             st.download_button("⬇️ Descargar copia", st.session_state["copia"],
-                               file_name=f"supermanager_{date.today().isoformat()}.db",
+                               file_name=f"supermanager_{ahora().date().isoformat()}.db",
                                mime="application/octet-stream")
 
         st.divider()
