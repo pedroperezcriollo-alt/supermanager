@@ -1,4 +1,5 @@
 from datetime import datetime, date, time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import streamlit as st
@@ -6,11 +7,23 @@ import streamlit as st
 import copias
 import crear_db
 import db
-import identidad
+import extras
 from procesar_jornada import (CAMPOS, CONFIG_DEFECTO, MOTIVO_AUTOTOPILLO,
                               guardar_config, leer_config, procesar_cierre_jornada)
 
 ADMIN_PASSWORD = db.secreto("SM_ADMIN_PASSWORD", "cambiame")
+
+# El servidor de Streamlit Cloud va en hora UTC: todas las horas de la liga
+# (cierre del mercado) se interpretan en hora de Madrid.
+try:
+    ZONA = ZoneInfo("Europe/Madrid")
+except ZoneInfoNotFoundError:  # Windows sin el paquete tzdata
+    ZONA = None
+
+
+def ahora():
+    """Hora actual en Madrid, sin zona (para comparar con las horas guardadas)."""
+    return datetime.now(ZONA).replace(tzinfo=None) if ZONA else datetime.now()
 
 st.set_page_config(page_title="SuperManager Basket", page_icon="🏀", layout="centered")
 
@@ -51,7 +64,7 @@ def mercado_cerrado(j):
     cierre = j["cierre_mercado"]
     if isinstance(cierre, str) and cierre:
         try:
-            return datetime.now() >= datetime.fromisoformat(cierre)
+            return ahora() >= datetime.fromisoformat(cierre)
         except ValueError:
             return False
     return False
@@ -74,7 +87,8 @@ ORDER BY Puntos DESC
 """
 
 st.title("🏀 SuperManager Basket")
-tab_clas, tab_quinteto, tab_admin = st.tabs(["Clasificación", "Mi quinteto", "Panel de admin"])
+tab_clas, tab_quinteto, tab_pista, tab_jug, tab_admin = st.tabs(
+    ["Clasificación", "Mi quinteto", "Pista", "Jugadores", "Panel de admin"])
 
 
 # ---------- 1. CLASIFICACIÓN ----------
@@ -119,32 +133,12 @@ with tab_quinteto:
         cierre = j["cierre_mercado"] if isinstance(j["cierre_mercado"], str) else None
         st.write(f"**Jornada {int(j['numero'])}**" + (f" · cierre del mercado: {cierre}" if cierre else ""))
 
-        managers = query("SELECT id, nombre, presupuesto FROM managers ORDER BY nombre")
-        sesion = managers[managers["id"] == st.session_state.get("yo", -1)]
-
         if mercado_cerrado(j):
             st.warning("El mercado está cerrado. No se pueden hacer cambios (Ley 5: −15 pts).")
-        elif sesion.empty:
-            # Identificarse: nombre + código personal
-            with st.form("entrar"):
-                nombre_m = st.selectbox("¿Quién eres?", managers["nombre"].tolist())
-                codigo = st.text_input("Tu código", type="password", max_chars=8)
-                if st.form_submit_button("Entrar"):
-                    m_id = int(managers.loc[managers["nombre"] == nombre_m, "id"].iloc[0])
-                    if not identidad.tiene_codigo(CON, m_id):
-                        st.error("Todavía no tienes código. Pídeselo al admin.")
-                    elif identidad.comprobar(CON, m_id, codigo):
-                        st.session_state["yo"] = m_id
-                        st.rerun()
-                    else:
-                        st.error("Código incorrecto.")
         else:
-            m = sesion.iloc[0]
-            c_yo, c_salir = st.columns([4, 1])
-            c_yo.write(f"Has entrado como **{m['nombre']}**")
-            if c_salir.button("Salir"):
-                st.session_state.pop("yo", None)
-                st.rerun()
+            managers = query("SELECT id, nombre, presupuesto FROM managers ORDER BY nombre")
+            nombre_m = st.selectbox("¿Quién eres?", managers["nombre"].tolist())
+            m = managers[managers["nombre"] == nombre_m].iloc[0]
 
             jug = query("SELECT id, nombre, precio_actual FROM jugadores ORDER BY precio_actual DESC, nombre")
             precios = dict(zip(jug["id"], jug["precio_actual"]))
@@ -164,6 +158,7 @@ with tab_quinteto:
             c1.metric("Elegidos", f"{len(elegidos)}/5")
             c2.metric("Coste", eur(coste))
             c3.metric("Te queda", eur(restante))
+            extras.pista_en_vivo(query, elegidos)
 
             if st.button("Guardar quinteto", type="primary"):
                 if len(elegidos) != 5:
@@ -185,6 +180,14 @@ with tab_quinteto:
         st.dataframe(mercado, hide_index=True, width="stretch")
 
 
+# ---------- PISTA Y JUGADORES ----------
+with tab_pista:
+    extras.render_pista(query, eur, mercado_cerrado)
+
+with tab_jug:
+    extras.render_jugadores(query, eur)
+
+
 # ---------- 3. PANEL DE ADMIN ----------
 with tab_admin:
     st.subheader("Panel de admin")
@@ -196,8 +199,6 @@ with tab_admin:
     if ADMIN_PASSWORD == "cambiame":
         st.warning("Estás usando la contraseña por defecto. Pon SM_ADMIN_PASSWORD en los secretos de la app.")
     st.caption(f"Base de datos en uso: {db.descripcion()}")
-    if "aviso_admin" in st.session_state:
-        st.success(st.session_state.pop("aviso_admin"))
 
     st.session_state.setdefault("ver", 0)
 
@@ -208,7 +209,7 @@ with tab_admin:
         with st.form("nueva_jornada"):
             c1, c2, c3 = st.columns(3)
             n = c1.number_input("Nº jornada", min_value=1, value=siguiente, step=1)
-            f = c2.date_input("Fecha del partido", value=date.today())
+            f = c2.date_input("Fecha del partido", value=ahora().date())
             h = c3.time_input("Hora del salto inicial", value=time(20, 0))
             if st.form_submit_button("Abrir jornada"):
                 if db.filas(CON, "SELECT 1 FROM jornadas WHERE numero = ?", (int(n),)):
@@ -315,8 +316,7 @@ with tab_admin:
         nuevos = {}
         for k in CONFIG_DEFECTO:
             paso = 0.05 if k == "peso_precio_anterior" else (1.0 if k == "pen_autotopillo" else 1000.0)
-            nuevos[k] = st.number_input(etiquetas[k], value=float(cfg[k]), step=paso,
-                                        key=f"cfg_{k}_{st.session_state['ver']}")
+            nuevos[k] = st.number_input(etiquetas[k], value=float(cfg[k]), step=paso, key=f"cfg_{k}")
         if st.button("Guardar reglas"):
             with db.transaccion(CON):
                 guardar_config(CON, nuevos)
@@ -331,7 +331,7 @@ with tab_admin:
                 st.session_state["copia"] = copias.exportar(CON)
         if "copia" in st.session_state:
             st.download_button("⬇️ Descargar copia", st.session_state["copia"],
-                               file_name=f"supermanager_{date.today().isoformat()}.db",
+                               file_name=f"supermanager_{ahora().date().isoformat()}.db",
                                mime="application/octet-stream")
 
         st.divider()
@@ -345,43 +345,4 @@ with tab_admin:
                 st.error(f"No se pudo restaurar: {e}")
             else:
                 st.session_state["ver"] += 1
-                st.session_state["aviso_admin"] = ("Datos restaurados: "
-                                                   + ", ".join(f"{t} {n}" for t, n in resumen.items()))
-                st.rerun()
-
-    # --- E. Códigos de los mánagers ---
-    with st.expander("5. Códigos de los mánagers"):
-        st.caption("Cada mánager necesita su código para guardar quinteto. Los códigos solo se ven "
-                   "al generarlos: mándaselo a cada uno por privado. Si alguien lo pierde, genérale "
-                   "uno nuevo (el anterior deja de valer).")
-        estado_cod = query("""SELECT nombre AS Mánager,
-                                     CASE WHEN pin_hash IS NULL OR pin_hash = '' THEN '—' ELSE '✅' END AS Código
-                              FROM managers ORDER BY nombre""")
-        st.dataframe(estado_cod, hide_index=True, width="stretch")
-        sin_codigo = estado_cod.loc[estado_cod["Código"] == "—", "Mánager"].tolist()
-        para = st.multiselect("Generar código nuevo para", estado_cod["Mánager"].tolist(),
-                              default=sin_codigo, key=f"cod_para_{st.session_state['ver']}")
-        if st.button("Generar códigos", disabled=not para):
-            st.session_state["codigos_nuevos"] = identidad.generar_codigos(CON, para)
-            st.session_state["ver"] += 1
-            st.rerun()
-        if "codigos_nuevos" in st.session_state:
-            st.success("Códigos nuevos. Apúntalos ahora: cuando pulses el botón de abajo no se vuelven a ver.")
-            st.dataframe(pd.DataFrame(list(st.session_state["codigos_nuevos"].items()),
-                                      columns=["Mánager", "Código"]), hide_index=True, width="stretch")
-            if st.button("Ya los he apuntado"):
-                st.session_state.pop("codigos_nuevos")
-                st.rerun()
-
-    # --- F. Reinicio ---
-    with st.expander("6. Empezar la liga de cero"):
-        st.caption("Borra jornadas, quintetos, estadísticas, sanciones e historial de precios, y deja a "
-                   "todos los jugadores con el precio base. Se mantienen los mánagers y sus códigos. "
-                   "Si quieres guardar lo que hay, descarga antes una copia (sección 4).")
-        reglas_def = st.checkbox("Volver también a las reglas del mercado por defecto")
-        confirmacion = st.text_input("Escribe BORRAR para confirmar", key=f"borrar_{st.session_state['ver']}")
-        if st.button("Empezar de cero", disabled=confirmacion.strip().upper() != "BORRAR"):
-            crear_db.empezar_de_cero(CON, reglas_por_defecto=reglas_def)
-            st.session_state["ver"] += 1
-            st.session_state["aviso_admin"] = "Liga reiniciada: todo listo para la jornada 1."
-            st.rerun()
+                st.success("Datos restaurados: " + ", ".join(f"{t} {n}" for t, n in resumen.items()))
